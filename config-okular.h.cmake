@@ -7,6 +7,9 @@
 /* Defines if qtspeech is available */
 #cmakedefine01 HAVE_SPEECH
 
+/* Defines if the OpenAI-compatible HTTP TTS backend is available (Qt Multimedia + Qt Network) */
+#cmakedefine01 HAVE_OPENAI_TTS
+
 /* Defines if kwallet is available */
 #cmakedefine01 HAVE_KWALLET
 

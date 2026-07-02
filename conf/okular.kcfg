@@ -215,6 +215,23 @@
   <entry key="ttsVoice" type="String">
     <default></default>
   </entry>
+  <entry key="ttsOpenAIUrl" type="String">
+    <default>http://127.0.0.1:9876</default>
+  </entry>
+  <entry key="ttsOpenAIModel" type="String">
+    <default>mlx-community/Kokoro-82M-bf16</default>
+  </entry>
+  <entry key="ttsOpenAIVoice" type="String">
+    <default>af_heart</default>
+  </entry>
+  <entry key="ttsOpenAISpeed" type="Double">
+    <default>1.0</default>
+    <min>0.25</min>
+    <max>4.0</max>
+  </entry>
+  <entry key="ttsOpenAIApiKey" type="String">
+    <default></default>
+  </entry>
   <entry key="WatchFile" type="Bool" >
    <default>true</default>
   </entry>

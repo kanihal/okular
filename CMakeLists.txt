@@ -174,6 +174,20 @@ if (BUILD_DESKTOP)
     else()
         set(HAVE_SPEECH 0)
     endif()
+
+    find_package(Qt6Multimedia ${QT_REQUIRED_VERSION} CONFIG)
+    set_package_properties(Qt6Multimedia PROPERTIES
+        TYPE OPTIONAL
+        PURPOSE "Together with Qt6Network, enables the OpenAI-compatible HTTP text-to-speech backend.")
+    find_package(Qt6Network ${QT_REQUIRED_VERSION} CONFIG)
+    set_package_properties(Qt6Network PROPERTIES
+        TYPE OPTIONAL
+        PURPOSE "Together with Qt6Multimedia, enables the OpenAI-compatible HTTP text-to-speech backend.")
+    if (Qt6TextToSpeech_FOUND AND Qt6Multimedia_FOUND AND Qt6Network_FOUND)
+        set(HAVE_OPENAI_TTS 1)
+    else()
+        set(HAVE_OPENAI_TTS 0)
+    endif()
 endif()
 
 if (BUILD_MOBILE)
@@ -574,6 +588,10 @@ if(BUILD_DESKTOP)
 if (Qt6TextToSpeech_FOUND)
    set(okularpart_SRCS ${okularpart_SRCS}
       part/tts.cpp)
+   if (HAVE_OPENAI_TTS)
+      set(okularpart_SRCS ${okularpart_SRCS}
+         part/openaitts.cpp)
+   endif()
 endif()
 
 kconfig_add_kcfg_files(okularpart_SRCS GENERATE_MOC conf/settings.kcfgc)
@@ -615,6 +633,10 @@ set_target_properties(okularpart PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_LIB
 
 if (Qt6TextToSpeech_FOUND)
    target_link_libraries(okularpart Qt6::TextToSpeech)
+endif()
+
+if (HAVE_OPENAI_TTS)
+   target_link_libraries(okularpart Qt6::Multimedia Qt6::Network)
 endif()
 
 #instead install the part to this path so it can be found
