@@ -47,6 +47,19 @@ if(APPLE)
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/MacOSXBundleInfo.plist.in"
         MACOSX_BUNDLE_GUI_IDENTIFIER "org.kde.okular"
         MACOSX_BUNDLE_COPYRIGHT "2002-2026 The Okular Developers")
+
+    # Bundle a fontconfig configuration so poppler can substitute
+    # non-embedded PDF fonts; the fontconfig library's compiled-in config
+    # path does not exist outside the build machine (see shell/main.cpp).
+    install(FILES mac/fontconfig/fonts.conf
+            DESTINATION ${KDE_INSTALL_BUNDLEDIR}/okular.app/Contents/Resources/etc/fonts)
+    install(DIRECTORY mac/fontconfig/conf.d
+            DESTINATION ${KDE_INSTALL_BUNDLEDIR}/okular.app/Contents/Resources/etc/fonts)
+    # Carlito (SIL OFL) is metric-compatible with Calibri; fonts.conf scans
+    # Resources/fonts so non-embedded Calibri keeps its glyph spacing even on
+    # systems where Apple's document-compatibility fonts are unavailable.
+    install(FILES mac/fontconfig/fonts/Carlito.ttc mac/fontconfig/fonts/NOTICE.txt
+            DESTINATION ${KDE_INSTALL_BUNDLEDIR}/okular.app/Contents/Resources/fonts)
 endif()
 
 # okular shell data files

@@ -1,0 +1,11 @@
+Carlito.ttc — the Carlito font family (Regular, Italic, Bold, Bold Italic)
+Copyright (c) 2010-2013 by tyPoland Lukasz Dziedzic with Reserved Font Name "Carlito".
+
+Licensed under the SIL Open Font License, Version 1.1.
+The complete license text is embedded in the font file's metadata (name table)
+and is available at: https://openfontlicense.org
+
+Carlito is metric-compatible with Microsoft Calibri. It is bundled so that
+PDFs using non-embedded Calibri render with correct glyph spacing on systems
+where neither Calibri nor Carlito is installed (fontconfig's
+30-metric-aliases.conf maps Calibri to Carlito).

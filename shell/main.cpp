@@ -22,6 +22,8 @@
 #include <QApplication>
 #include <QCommandLineOption>
 #include <QCommandLineParser>
+#include <QDir>
+#include <QFile>
 #include <QFileOpenEvent>
 #include <QObject>
 #include <QStringList>
@@ -75,6 +77,23 @@ int main(int argc, char **argv)
     QCoreApplication::setAttribute(Qt::AA_CompressTabletEvents);
 
     QApplication app(argc, argv);
+
+#ifdef Q_OS_MACOS
+    /**
+     * The fontconfig library bundled by Craft has its default configuration
+     * path compiled in from the build machine, so at runtime it finds no
+     * configuration and no font substitution rules. Poppler then matches
+     * non-embedded PDF fonts against unusable fonts and text renders as
+     * .notdef boxes. Point fontconfig at the configuration shipped in the
+     * app bundle unless the user has set one explicitly.
+     */
+    if (qEnvironmentVariableIsEmpty("FONTCONFIG_PATH") && qEnvironmentVariableIsEmpty("FONTCONFIG_FILE")) {
+        const QString fontsDir = QDir::cleanPath(QCoreApplication::applicationDirPath() + QStringLiteral("/../Resources/etc/fonts"));
+        if (QFile::exists(fontsDir + QStringLiteral("/fonts.conf"))) {
+            qputenv("FONTCONFIG_PATH", QFile::encodeName(fontsDir));
+        }
+    }
+#endif
 
     /**
      * Install event filter to handle macOS file opening.
