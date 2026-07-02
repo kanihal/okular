@@ -24,23 +24,29 @@
 #include <QClipboard>
 #include <QCursor>
 #include <QDesktopServices>
+#include <QDoubleSpinBox>
 #include <QElapsedTimer>
 #include <QEvent>
 #include <QGestureEvent>
 #include <QImage>
 #include <QInputDialog>
+#include <QLabel>
 #include <QLoggingCategory>
 #include <QMenu>
 #include <QMimeData>
 #include <QMimeDatabase>
 #include <QNativeGestureEvent>
 #include <QPainter>
+#include <QPixmap>
 #include <QScrollBar>
 #include <QScroller>
 #include <QScrollerProperties>
 #include <QSet>
+#include <QSignalBlocker>
 #include <QTimer>
 #include <QToolTip>
+#include <QVector>
+#include <QWidgetAction>
 
 #include <KActionCollection>
 #include <KActionMenu>
@@ -63,9 +69,11 @@
 #include <kwidgetsaddons_version.h>
 
 // system includes
+#include <algorithm>
 #include <array>
 #include <math.h>
 #include <stdlib.h>
+#include <utility>
 
 // local includes
 #include "annotationpopup.h"
@@ -143,6 +151,45 @@ TableSelectionPart::TableSelectionPart(PageViewItem *item_p, const Okular::Norma
 {
 }
 
+#if HAVE_SPEECH
+struct SpeechSegment {
+    QString text;
+    int pageNumber = -1;
+    Okular::RegularAreaRect area;
+};
+
+static QIcon monochromeSvgIcon(const QString &resourcePath, const QColor &color, const QIcon &fallback)
+{
+    const QIcon sourceIcon(resourcePath);
+    if (sourceIcon.isNull()) {
+        return fallback;
+    }
+
+    QIcon tintedIcon;
+    const QList<QSize> sizes {QSize(16, 16), QSize(22, 22), QSize(32, 32)};
+    for (const QSize &size : sizes) {
+        const QPixmap sourcePixmap = sourceIcon.pixmap(size);
+        if (sourcePixmap.isNull()) {
+            continue;
+        }
+
+        QPixmap tintedPixmap(sourcePixmap.size());
+        tintedPixmap.setDevicePixelRatio(sourcePixmap.devicePixelRatio());
+        tintedPixmap.fill(Qt::transparent);
+
+        QPainter painter(&tintedPixmap);
+        painter.drawPixmap(0, 0, sourcePixmap);
+        painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+        painter.fillRect(tintedPixmap.rect(), color);
+        painter.end();
+
+        tintedIcon.addPixmap(tintedPixmap);
+    }
+
+    return tintedIcon.isNull() ? fallback : tintedIcon;
+}
+#endif
+
 // structure used internally by PageView for data storage
 class PageViewPrivate
 {
@@ -152,6 +199,19 @@ public:
     FormWidgetsController *formWidgetsController();
 #if HAVE_SPEECH
     OkularTTS *tts();
+    QVector<SpeechSegment> speechSegmentsForPageRange(int firstPage, int lastPage);
+    QVector<SpeechSegment> speechSegmentsFromPoint(int pageNumber, const Okular::NormalizedPoint &point);
+    QVector<SpeechSegment> speechSegmentsFromSelection();
+    void speakSegments(QVector<SpeechSegment> segments);
+    void updateSpeechState(OkularTTS::SpeechState state);
+    void updateCurrentSpeechSegment(int index);
+    void updateSpeechToolbar();
+    void paintSpeechHighlight(QPainter *painter, const QRect &contentsRect);
+    QRect speechSegmentContentRect(const SpeechSegment &segment) const;
+    QRect currentSpeechSegmentContentRect() const;
+    bool isSpeechSegmentVisible(const SpeechSegment &segment) const;
+    void scrollToSpeechSegment(const SpeechSegment &segment);
+    void scrollToCurrentSpeechSegment();
 #endif
     QString selectedText() const;
 
@@ -214,6 +274,9 @@ public:
     FormWidgetsController *formsWidgetController = nullptr;
 #if HAVE_SPEECH
     OkularTTS *m_tts = nullptr;
+    QVector<SpeechSegment> speechSegments;
+    int currentSpeechSegmentIndex = -1;
+    OkularTTS::SpeechState speechState = OkularTTS::SpeechState::Idle;
 #endif
     QTimer *refreshTimer = nullptr;
     QSet<int> refreshPages;
@@ -270,6 +333,13 @@ public:
     QAction *aSpeakPage = nullptr;
     QAction *aSpeakStop = nullptr;
     QAction *aSpeakPauseResume = nullptr;
+    QWidgetAction *aSpeakToolbarStatus = nullptr;
+    QAction *aSpeakToolbarLocateCurrent = nullptr;
+    QAction *aSpeakToolbarPauseResume = nullptr;
+    QAction *aSpeakToolbarStop = nullptr;
+    QWidgetAction *aSpeakToolbarSpeed = nullptr;
+    QLabel *speakToolbarStatusLabel = nullptr;
+    QDoubleSpinBox *speakToolbarSpeedSpinBox = nullptr;
     KActionCollection *actionCollection = nullptr;
     QActionGroup *mouseModeActionGroup = nullptr;
     ToggleActionMenu *aMouseModeMenu = nullptr;
@@ -323,9 +393,369 @@ OkularTTS *PageViewPrivate::tts()
         if (aSpeakPauseResume) {
             QObject::connect(m_tts, &OkularTTS::canPauseOrResume, aSpeakPauseResume, &QAction::setEnabled);
         }
+        if (aSpeakToolbarStop) {
+            QObject::connect(m_tts, &OkularTTS::canPauseOrResume, aSpeakToolbarStop, &QAction::setEnabled);
+        }
+        if (aSpeakToolbarPauseResume) {
+            QObject::connect(m_tts, &OkularTTS::canPauseOrResume, aSpeakToolbarPauseResume, &QAction::setEnabled);
+        }
+
+        QObject::connect(m_tts, &OkularTTS::speechStateChanged, q, [this](OkularTTS::SpeechState state) { updateSpeechState(state); });
+        QObject::connect(m_tts, &OkularTTS::currentSegmentChanged, q, [this](int index) { updateCurrentSpeechSegment(index); });
+        QObject::connect(m_tts, &OkularTTS::errorOccurred, q, [this](const QString &message) { q->displayMessage(message, QString(), PageViewMessage::Error); });
     }
 
     return m_tts;
+}
+
+static bool isSpeechTerminator(QChar c)
+{
+    return c == QLatin1Char('.') || c == QLatin1Char('!') || c == QLatin1Char('?') || c == QChar(0x2026) /* … */;
+}
+
+static bool endsSpeechSentence(const QString &text)
+{
+    for (auto it = text.crbegin(), end = text.crend(); it != end; ++it) {
+        const QChar c = *it;
+        if (c.isSpace() || c == QLatin1Char('"') || c == QLatin1Char('\'') || c == QChar(0x2019) || c == QChar(0x201D) || c == QLatin1Char(')') || c == QLatin1Char(']')) {
+            continue;
+        }
+        return isSpeechTerminator(c);
+    }
+    return false;
+}
+
+static bool isSpeakableSpeechText(const QString &text)
+{
+    return std::any_of(text.cbegin(), text.cend(), [](QChar c) { return c.isLetterOrNumber(); });
+}
+
+static int wordIndexAtPoint(const Okular::TextEntity::List &words, const Okular::NormalizedPoint &point)
+{
+    for (int i = 0; i < words.size(); ++i) {
+        if (words.at(i).area().contains(point.x, point.y)) {
+            return i;
+        }
+    }
+
+    for (int i = 0; i < words.size(); ++i) {
+        const Okular::NormalizedRect area = words.at(i).area();
+        if (area.bottom >= point.y && area.right >= point.x) {
+            return i;
+        }
+    }
+
+    return 0;
+}
+
+static void appendSpeechSegmentsFromWords(const Okular::TextEntity::List &words, int startIndex, int pageNumber, QVector<SpeechSegment> *segments)
+{
+    QString segmentText;
+    Okular::RegularAreaRect segmentArea;
+
+    const auto flushSegment = [&]() {
+        const QString text = segmentText.simplified();
+        if (isSpeakableSpeechText(text) && !segmentArea.isEmpty()) {
+            segments->append({text, pageNumber, segmentArea});
+        }
+        segmentText.clear();
+        segmentArea.clear();
+    };
+
+    for (int i = qMax(0, startIndex); i < words.size(); ++i) {
+        const Okular::TextEntity &word = words.at(i);
+        const QString text = word.text();
+        if (text.isEmpty()) {
+            continue;
+        }
+        segmentText += text;
+        segmentArea.append(word.area());
+
+        if (endsSpeechSentence(text) || segmentText.simplified().size() >= 700) {
+            flushSegment();
+        }
+    }
+    flushSegment();
+}
+
+QVector<SpeechSegment> PageViewPrivate::speechSegmentsForPageRange(int firstPage, int lastPage)
+{
+    QVector<SpeechSegment> segments;
+    if (items.isEmpty()) {
+        return segments;
+    }
+
+    firstPage = qBound(0, firstPage, items.size() - 1);
+    lastPage = qBound(firstPage, lastPage, items.size() - 1);
+    for (int page = firstPage; page <= lastPage; ++page) {
+        const PageViewItem *item = items.at(page);
+        if (!item->page()->hasTextPage()) {
+            document->requestTextPage(item->pageNumber());
+        }
+        appendSpeechSegmentsFromWords(item->page()->words(nullptr, Okular::TextPage::CentralPixelTextAreaInclusionBehaviour), 0, item->pageNumber(), &segments);
+    }
+    return segments;
+}
+
+QVector<SpeechSegment> PageViewPrivate::speechSegmentsFromPoint(int pageNumber, const Okular::NormalizedPoint &point)
+{
+    QVector<SpeechSegment> segments;
+    if (pageNumber < 0 || pageNumber >= items.size()) {
+        return segments;
+    }
+
+    for (int page = pageNumber; page < items.size(); ++page) {
+        const PageViewItem *item = items.at(page);
+        if (!item->page()->hasTextPage()) {
+            document->requestTextPage(item->pageNumber());
+        }
+        const Okular::TextEntity::List words = item->page()->words(nullptr, Okular::TextPage::CentralPixelTextAreaInclusionBehaviour);
+        const int startIndex = (page == pageNumber) ? wordIndexAtPoint(words, point) : 0;
+        appendSpeechSegmentsFromWords(words, startIndex, item->pageNumber(), &segments);
+    }
+    return segments;
+}
+
+QVector<SpeechSegment> PageViewPrivate::speechSegmentsFromSelection()
+{
+    QVector<SpeechSegment> segments;
+    QList<int> selectedPages = pagesWithTextSelection.values();
+    std::sort(selectedPages.begin(), selectedPages.end());
+
+    for (int pageNumber : std::as_const(selectedPages)) {
+        const Okular::Page *page = document->page(pageNumber);
+        if (!page) {
+            continue;
+        }
+        if (!page->hasTextPage()) {
+            document->requestTextPage(pageNumber);
+        }
+        appendSpeechSegmentsFromWords(page->words(page->textSelection(), Okular::TextPage::CentralPixelTextAreaInclusionBehaviour), 0, pageNumber, &segments);
+    }
+    return segments;
+}
+
+void PageViewPrivate::speakSegments(QVector<SpeechSegment> segments)
+{
+    if (segments.isEmpty()) {
+        q->displayMessage(i18n("No speakable text found."), QString(), PageViewMessage::Warning);
+        return;
+    }
+
+    speechSegments = std::move(segments);
+    currentSpeechSegmentIndex = -1;
+    QStringList texts;
+    texts.reserve(speechSegments.size());
+    for (const SpeechSegment &segment : std::as_const(speechSegments)) {
+        texts.append(segment.text);
+    }
+    tts()->saySegments(texts);
+    updateSpeechToolbar();
+}
+
+QRect PageViewPrivate::speechSegmentContentRect(const SpeechSegment &segment) const
+{
+    if (segment.pageNumber < 0 || segment.pageNumber >= items.size()) {
+        return QRect();
+    }
+    const PageViewItem *item = items.at(segment.pageNumber);
+    QRect rect;
+    for (QRect part : segment.area.geometry(item->uncroppedWidth(), item->uncroppedHeight())) {
+        part.translate(item->uncroppedGeometry().topLeft());
+        rect = rect.isNull() ? part : rect.united(part);
+    }
+    return rect;
+}
+
+static QList<QRect> speechHighlightLineRects(const QList<QRect> &rects)
+{
+    QList<QRect> lines;
+    for (QRect rect : rects) {
+        if (!rect.isValid()) {
+            continue;
+        }
+
+        rect = rect.adjusted(-2, -1, 2, 1);
+        bool merged = false;
+        for (QRect &line : lines) {
+            const int verticalTolerance = qMax(3, qMin(line.height(), rect.height()) / 2);
+            const bool sameLine = qAbs(line.center().y() - rect.center().y()) <= verticalTolerance;
+            const bool closeHorizontally = rect.left() <= line.right() + 80 && rect.right() >= line.left() - 80;
+            if (sameLine && closeHorizontally) {
+                line = line.united(rect);
+                merged = true;
+                break;
+            }
+        }
+
+        if (!merged) {
+            lines.append(rect);
+        }
+    }
+
+    std::sort(lines.begin(), lines.end(), [](const QRect &left, const QRect &right) {
+        return left.top() == right.top() ? left.left() < right.left() : left.top() < right.top();
+    });
+    return lines;
+}
+
+QRect PageViewPrivate::currentSpeechSegmentContentRect() const
+{
+    if (currentSpeechSegmentIndex < 0 || currentSpeechSegmentIndex >= speechSegments.size()) {
+        return QRect();
+    }
+    return speechSegmentContentRect(speechSegments.at(currentSpeechSegmentIndex));
+}
+
+bool PageViewPrivate::isSpeechSegmentVisible(const SpeechSegment &segment) const
+{
+    const QRect rect = speechSegmentContentRect(segment);
+    if (!rect.isValid()) {
+        return false;
+    }
+
+    const QRect viewportRect(q->horizontalScrollBar()->value(), q->verticalScrollBar()->value(), q->viewport()->width(), q->viewport()->height());
+    return viewportRect.intersects(rect);
+}
+
+void PageViewPrivate::paintSpeechHighlight(QPainter *painter, const QRect &contentsRect)
+{
+    if (currentSpeechSegmentIndex < 0 || currentSpeechSegmentIndex >= speechSegments.size()) {
+        return;
+    }
+
+    const SpeechSegment &segment = speechSegments.at(currentSpeechSegmentIndex);
+    if (segment.pageNumber < 0 || segment.pageNumber >= items.size()) {
+        return;
+    }
+    const PageViewItem *item = items.at(segment.pageNumber);
+    QColor fill = q->palette().color(QPalette::Active, QPalette::Highlight);
+    fill.setAlphaF(0.18);
+
+    QList<QRect> rects = segment.area.geometry(item->uncroppedWidth(), item->uncroppedHeight());
+    for (QRect &rect : rects) {
+        rect.translate(item->uncroppedGeometry().topLeft());
+    }
+
+    painter->save();
+    painter->setRenderHint(QPainter::Antialiasing, true);
+    painter->setPen(Qt::NoPen);
+    painter->setBrush(fill);
+    for (const QRect &rect : speechHighlightLineRects(rects)) {
+        if (!rect.intersects(contentsRect)) {
+            continue;
+        }
+        painter->drawRoundedRect(QRectF(rect.adjusted(-1, -2, 1, 2)), 3, 3);
+    }
+    painter->restore();
+}
+
+void PageViewPrivate::scrollToSpeechSegment(const SpeechSegment &segment)
+{
+    const QRect rect = speechSegmentContentRect(segment);
+    if (!rect.isValid()) {
+        return;
+    }
+
+    const int margin = 24;
+    const QRect viewportRect(q->horizontalScrollBar()->value(), q->verticalScrollBar()->value(), q->viewport()->width(), q->viewport()->height());
+    QRect comfortableViewport = viewportRect.adjusted(margin, margin, -margin, -margin);
+    if (comfortableViewport.contains(rect)) {
+        return;
+    }
+
+    int x = q->horizontalScrollBar()->value();
+    int y = q->verticalScrollBar()->value();
+    if (rect.left() < comfortableViewport.left()) {
+        x = rect.left() - margin;
+    } else if (rect.right() > comfortableViewport.right()) {
+        x = rect.right() + margin - q->viewport()->width();
+    }
+    if (rect.top() < comfortableViewport.top()) {
+        y = rect.top() - margin;
+    } else if (rect.bottom() > comfortableViewport.bottom()) {
+        y = rect.bottom() + margin - q->viewport()->height();
+    }
+
+    q->horizontalScrollBar()->setValue(qBound(q->horizontalScrollBar()->minimum(), x, q->horizontalScrollBar()->maximum()));
+    q->verticalScrollBar()->setValue(qBound(q->verticalScrollBar()->minimum(), y, q->verticalScrollBar()->maximum()));
+}
+
+void PageViewPrivate::scrollToCurrentSpeechSegment()
+{
+    if (currentSpeechSegmentIndex < 0 || currentSpeechSegmentIndex >= speechSegments.size()) {
+        return;
+    }
+
+    scrollToSpeechSegment(speechSegments.at(currentSpeechSegmentIndex));
+}
+
+void PageViewPrivate::updateCurrentSpeechSegment(int index)
+{
+    const bool shouldFollowSpeech = currentSpeechSegmentIndex < 0
+        || (currentSpeechSegmentIndex < speechSegments.size() && isSpeechSegmentVisible(speechSegments.at(currentSpeechSegmentIndex)));
+
+    currentSpeechSegmentIndex = index;
+    if (shouldFollowSpeech) {
+        scrollToCurrentSpeechSegment();
+    }
+    q->viewport()->update();
+    updateSpeechToolbar();
+}
+
+void PageViewPrivate::updateSpeechState(OkularTTS::SpeechState state)
+{
+    speechState = state;
+    if (speechState == OkularTTS::SpeechState::Idle) {
+        currentSpeechSegmentIndex = -1;
+        speechSegments.clear();
+        q->viewport()->update();
+    }
+    updateSpeechToolbar();
+}
+
+void PageViewPrivate::updateSpeechToolbar()
+{
+    const bool active = speechState != OkularTTS::SpeechState::Idle;
+    const QList<QAction *> toolbarActions {aSpeakToolbarStatus, aSpeakToolbarPauseResume, aSpeakToolbarStop, aSpeakToolbarSpeed};
+    for (QAction *action : toolbarActions) {
+        if (action) {
+            action->setVisible(active);
+            action->setEnabled(active);
+        }
+    }
+
+    const bool hasCurrentSegment = currentSpeechSegmentIndex >= 0 && currentSpeechSegmentIndex < speechSegments.size();
+    if (aSpeakToolbarLocateCurrent) {
+        aSpeakToolbarLocateCurrent->setVisible(active && hasCurrentSegment);
+        aSpeakToolbarLocateCurrent->setEnabled(active && hasCurrentSegment);
+    }
+
+    if (speakToolbarStatusLabel) {
+        if (!active) {
+            speakToolbarStatusLabel->clear();
+            speakToolbarStatusLabel->setToolTip(QString());
+        } else if (currentSpeechSegmentIndex >= 0 && currentSpeechSegmentIndex < speechSegments.size()) {
+            const QString prefix = speechState == OkularTTS::SpeechState::Paused ? i18nc("@info:status", "Paused") : i18nc("@info:status", "Speaking");
+            speakToolbarStatusLabel->setText(i18nc("@info:status %1 is Playing/Paused, %2 is current sentence, %3 is total sentences", "%1 %2/%3", prefix, currentSpeechSegmentIndex + 1, speechSegments.size()));
+            speakToolbarStatusLabel->setToolTip(KStringHandler::rsqueeze(speechSegments.at(currentSpeechSegmentIndex).text, 180));
+        } else {
+            speakToolbarStatusLabel->setText(i18nc("@info:status", "Preparing speech..."));
+            speakToolbarStatusLabel->setToolTip(QString());
+        }
+    }
+
+    const bool paused = speechState == OkularTTS::SpeechState::Paused;
+    if (aSpeakToolbarPauseResume) {
+        aSpeakToolbarPauseResume->setIcon(QIcon::fromTheme(paused ? QStringLiteral("media-playback-start") : QStringLiteral("media-playback-pause")));
+        aSpeakToolbarPauseResume->setText(QString());
+        aSpeakToolbarPauseResume->setToolTip(paused ? i18n("Resume speaking") : i18n("Pause speaking"));
+        aSpeakToolbarPauseResume->setStatusTip(paused ? i18n("Resume speaking") : i18n("Pause speaking"));
+    }
+    if (aSpeakPauseResume) {
+        aSpeakPauseResume->setIcon(QIcon::fromTheme(paused ? QStringLiteral("media-playback-start") : QStringLiteral("media-playback-pause")));
+        aSpeakPauseResume->setText(paused ? i18n("Resume Speaking") : i18n("Pause Speaking"));
+    }
 }
 #endif
 
@@ -772,6 +1202,58 @@ void PageView::setupActions(KActionCollection *ac)
     ac->addAction(QStringLiteral("speak_pause_resume"), d->aSpeakPauseResume);
     d->aSpeakPauseResume->setEnabled(false);
     connect(d->aSpeakPauseResume, &QAction::triggered, this, &PageView::slotPauseResumeSpeech);
+
+    d->speakToolbarStatusLabel = new QLabel(this);
+    d->speakToolbarStatusLabel->setMinimumWidth(fontMetrics().horizontalAdvance(i18nc("@info:status", "Speaking 888/888")));
+    d->aSpeakToolbarStatus = new QWidgetAction(this);
+    d->aSpeakToolbarStatus->setText(i18nc("@action:intoolbar", "Speech Status"));
+    d->aSpeakToolbarStatus->setDefaultWidget(d->speakToolbarStatusLabel);
+    d->aSpeakToolbarStatus->setVisible(false);
+    ac->addAction(QStringLiteral("speak_toolbar_status"), d->aSpeakToolbarStatus);
+
+    const QIcon speechCurrentLineIcon = monochromeSvgIcon(QStringLiteral(":/icons/okular/speech-current-line.svg"), palette().color(QPalette::Active, QPalette::ButtonText), QIcon::fromTheme(QStringLiteral("text-speak")));
+    d->aSpeakToolbarLocateCurrent = new QAction(speechCurrentLineIcon, QString(), this);
+    d->aSpeakToolbarLocateCurrent->setToolTip(i18n("Go to current spoken sentence"));
+    d->aSpeakToolbarLocateCurrent->setStatusTip(i18n("Go to current spoken sentence"));
+    d->aSpeakToolbarLocateCurrent->setVisible(false);
+    d->aSpeakToolbarLocateCurrent->setEnabled(false);
+    ac->addAction(QStringLiteral("speak_toolbar_locate_current"), d->aSpeakToolbarLocateCurrent);
+    connect(d->aSpeakToolbarLocateCurrent, &QAction::triggered, this, [this]() {
+        d->scrollToCurrentSpeechSegment();
+    });
+
+    d->aSpeakToolbarPauseResume = new QAction(QIcon::fromTheme(QStringLiteral("media-playback-pause")), QString(), this);
+    d->aSpeakToolbarPauseResume->setToolTip(i18n("Pause speaking"));
+    d->aSpeakToolbarPauseResume->setStatusTip(i18n("Pause speaking"));
+    d->aSpeakToolbarPauseResume->setVisible(false);
+    d->aSpeakToolbarPauseResume->setEnabled(false);
+    ac->addAction(QStringLiteral("speak_toolbar_pause_resume"), d->aSpeakToolbarPauseResume);
+    connect(d->aSpeakToolbarPauseResume, &QAction::triggered, this, &PageView::slotPauseResumeSpeech);
+
+    d->aSpeakToolbarStop = new QAction(QIcon::fromTheme(QStringLiteral("media-playback-stop")), QString(), this);
+    d->aSpeakToolbarStop->setToolTip(i18n("Stop speaking"));
+    d->aSpeakToolbarStop->setStatusTip(i18n("Stop speaking"));
+    d->aSpeakToolbarStop->setVisible(false);
+    d->aSpeakToolbarStop->setEnabled(false);
+    ac->addAction(QStringLiteral("speak_toolbar_stop"), d->aSpeakToolbarStop);
+    connect(d->aSpeakToolbarStop, &QAction::triggered, this, &PageView::slotStopSpeaks);
+
+    d->speakToolbarSpeedSpinBox = new QDoubleSpinBox(this);
+    d->speakToolbarSpeedSpinBox->setRange(0.25, 4.0);
+    d->speakToolbarSpeedSpinBox->setSingleStep(0.05);
+    d->speakToolbarSpeedSpinBox->setDecimals(2);
+    d->speakToolbarSpeedSpinBox->setSuffix(i18nc("@label:spinbox speech speed multiplier suffix", "x"));
+    d->speakToolbarSpeedSpinBox->setValue(Okular::Settings::ttsOpenAISpeed());
+    d->speakToolbarSpeedSpinBox->setToolTip(i18n("Speech speed"));
+    d->speakToolbarSpeedSpinBox->setMinimumWidth(fontMetrics().horizontalAdvance(QStringLiteral("4.00x")) + 36);
+    connect(d->speakToolbarSpeedSpinBox, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double speed) {
+        d->tts()->setSpeed(speed);
+    });
+    d->aSpeakToolbarSpeed = new QWidgetAction(this);
+    d->aSpeakToolbarSpeed->setText(i18n("Speech Speed"));
+    d->aSpeakToolbarSpeed->setDefaultWidget(d->speakToolbarSpeedSpinBox);
+    d->aSpeakToolbarSpeed->setVisible(false);
+    ac->addAction(QStringLiteral("speak_toolbar_speed"), d->aSpeakToolbarSpeed);
 #else
     d->aSpeakDoc = nullptr;
     d->aSpeakPage = nullptr;
@@ -1883,6 +2365,9 @@ void PageView::paintEvent(QPaintEvent *pe)
     selectionRectInternal.adjust(1, 1, -1, -1);
     // color for blending
     QColor selBlendColor = (selectionRect.width() > 8 || selectionRect.height() > 8) ? d->mouseSelectionColor : Qt::red;
+#if HAVE_SPEECH
+    const QRect speechHighlightRect = d->currentSpeechSegmentContentRect();
+#endif
 
     // subdivide region into rects
     QRegion rgn = pe->region();
@@ -1914,6 +2399,9 @@ void PageView::paintEvent(QPaintEvent *pe)
         bool wantCompositing = !selectionRect.isNull() && contentsRect.intersects(selectionRect);
         // also alpha-blend when there is a table selection...
         wantCompositing |= !d->tableSelectionParts.isEmpty();
+#if HAVE_SPEECH
+        wantCompositing |= speechHighlightRect.isValid() && speechHighlightRect.intersects(contentsRect);
+#endif
 
         if (wantCompositing && Okular::Settings::enableCompositing()) {
             // create pixmap and open a painter over it (contents{left,top} becomes pixmap {0,0})
@@ -1989,6 +2477,9 @@ void PageView::paintEvent(QPaintEvent *pe)
                 }
             }
             drawTableDividers(&pixmapPainter);
+#if HAVE_SPEECH
+            d->paintSpeechHighlight(&pixmapPainter, contentsRect);
+#endif
             // 3a) Layer 1: give annotator painting control
             if (d->annotator && d->annotator->routePaints(contentsRect)) {
                 d->annotator->routePaint(&pixmapPainter, contentsRect);
@@ -2025,6 +2516,9 @@ void PageView::paintEvent(QPaintEvent *pe)
                 }
             }
             drawTableDividers(&screenPainter);
+#if HAVE_SPEECH
+            d->paintSpeechHighlight(&screenPainter, contentsRect);
+#endif
             // 3a) Layer 1: give annotator painting control
             if (d->annotator && d->annotator->routePaints(contentsRect)) {
                 d->annotator->routePaint(&screenPainter, contentsRect);
@@ -2954,7 +3448,7 @@ void PageView::mouseReleaseEvent(QMouseEvent *e)
             }
 #if HAVE_SPEECH
             if (Okular::Settings::useTTS()) {
-                speakText = menu.addAction(QIcon::fromTheme(QStringLiteral("text-speak")), i18n("Speak Text"));
+                speakText = menu.addAction(QIcon::fromTheme(QStringLiteral("text-speak")), i18n("Speak Selected Text"));
             }
 #endif
             if (copyAllowed) {
@@ -3024,7 +3518,9 @@ void PageView::mouseReleaseEvent(QMouseEvent *e)
 #if HAVE_SPEECH
                 else if (choice == speakText) {
                     // [2] speech selection using TTS
-                    d->tts()->say(selectedText);
+                    d->speechSegments = {{selectedText, -1, Okular::RegularAreaRect()}};
+                    d->currentSpeechSegmentIndex = -1;
+                    d->tts()->saySegments({selectedText});
                 }
 #endif
             }
@@ -3156,6 +3652,7 @@ void PageView::mouseReleaseEvent(QMouseEvent *e)
                 addAnnotationActionsForPoint(annotPopup, item, eventPos, &menu);
 #if HAVE_SPEECH
                 const QAction *speakText = nullptr;
+                const QAction *speakFromHere = nullptr;
 #endif
                 if (item->page()->textSelection()) {
                     if (!menu) {
@@ -3166,7 +3663,8 @@ void PageView::mouseReleaseEvent(QMouseEvent *e)
 
 #if HAVE_SPEECH
                     if (Okular::Settings::useTTS()) {
-                        speakText = menu->addAction(QIcon::fromTheme(QStringLiteral("text-speak")), i18n("Speak Text"));
+                        speakText = menu->addAction(QIcon::fromTheme(QStringLiteral("text-speak")), i18n("Speak Selected Text"));
+                        speakFromHere = menu->addAction(QIcon::fromTheme(QStringLiteral("text-speak")), i18n("Speak from Here"));
                     }
 #endif
                     if (!d->document->isAllowed(Okular::AllowCopy)) {
@@ -3202,8 +3700,14 @@ void PageView::mouseReleaseEvent(QMouseEvent *e)
                             copyTextSelection(TextCopyMode::WithoutLineBreaks);
 #if HAVE_SPEECH
                         } else if (choice == speakText) {
-                            const QString text = d->selectedText();
-                            d->tts()->say(text);
+                            QVector<SpeechSegment> segments = d->speechSegmentsFromSelection();
+                            if (segments.isEmpty()) {
+                                d->tts()->say(d->selectedText());
+                            } else {
+                                d->speakSegments(std::move(segments));
+                            }
+                        } else if (choice == speakFromHere) {
+                            d->speakSegments(d->speechSegmentsFromPoint(item->pageNumber(), Okular::NormalizedPoint(item->absToPageX(eventPos.x()), item->absToPageY(eventPos.y()))));
 #endif
                         } else if (choice == httpLink) {
                             auto *job = new KIO::OpenUrlJob(QUrl(url));
@@ -5656,41 +6160,19 @@ void PageView::slotRefreshPage()
 #if HAVE_SPEECH
 void PageView::slotSpeakDocument()
 {
-    QString text;
-    for (const PageViewItem *item : std::as_const(d->items)) {
-        std::unique_ptr<Okular::RegularAreaRect> area = textSelectionForItem(item);
-        text.append(item->page()->text(area.get()));
-        text.append(QLatin1Char('\n'));
-    }
-
-    d->tts()->say(text);
+    d->speakSegments(d->speechSegmentsForPageRange(0, d->items.size() - 1));
 }
 
 void PageView::slotSpeakFromCurrentPage()
 {
     const int currentPage = d->document->viewport().pageNumber;
-
-    QString text;
-    QList<PageViewItem *>::const_iterator dIt = d->items.constBegin(), dEnd = d->items.constEnd();
-
-    for (dIt += currentPage; dIt != dEnd; ++dIt) {
-        std::unique_ptr<Okular::RegularAreaRect> area = textSelectionForItem(*dIt);
-        text.append((*dIt)->page()->text(area.get()));
-        text.append(QLatin1Char('\n'));
-    }
-
-    d->tts()->say(text);
+    d->speakSegments(d->speechSegmentsForPageRange(currentPage, d->items.size() - 1));
 }
 
 void PageView::slotSpeakCurrentPage()
 {
     const int currentPage = d->document->viewport().pageNumber;
-
-    const PageViewItem *item = d->items.at(currentPage);
-    std::unique_ptr<Okular::RegularAreaRect> area = textSelectionForItem(item);
-    const QString text = item->page()->text(area.get());
-
-    d->tts()->say(text);
+    d->speakSegments(d->speechSegmentsForPageRange(currentPage, currentPage));
 }
 
 void PageView::slotStopSpeaks()

@@ -4,4 +4,7 @@
         <file>part.rc</file>
         <file>part-viewermode.rc</file>
     </qresource>
+    <qresource prefix="/icons/okular">
+        <file alias="speech-current-line.svg">data/speech-current-line.svg</file>
+    </qresource>
 </RCC>
